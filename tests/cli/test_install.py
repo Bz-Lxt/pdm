@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import pytest
 
 from pdm.cli import actions
@@ -486,3 +488,71 @@ def test_uv_install_pep582_not_allowed(project, pdm):
     result = pdm(["sync"], obj=project)
     assert result.exit_code == 1
     assert "doesn't support PEP 582 local packages" in result.stderr
+
+
+def _use_future_fstrings_index(project, index) -> None:
+    project.project_config["pypi.url"] = "https://my.pypi.org/simple"
+    project.pyproject.metadata["requires-python"] = ">=3.6"
+    project.pyproject.metadata["dependencies"] = ["future-fstrings"]
+    project.pyproject.write()
+    index["/simple/future-fstrings/"] = b"""
+    <html>
+    <body>
+        <h1>future-fstrings</h1>
+        <a href="http://fixtures.test/artifacts/future_fstrings-1.2.0-py2.py3-none-any.whl">
+        future_fstrings-1.2.0-py2.py3-none-any.whl
+        </a>
+    </body>
+    </html>
+    """
+
+
+def test_sync_repair_reinstalls_corrupted_package(project, index, pdm):
+    _use_future_fstrings_index(project, index)
+    # cleanup=False keeps the shared HTTP client alive across commands,
+    # otherwise the third network request fails with a closed client.
+    pdm(["lock"], obj=project, strict=True, cleanup=False)
+    pdm(["sync", "--no-self"], obj=project, strict=True, cleanup=False)
+
+    dist = project.environment.get_working_set()["future-fstrings"]
+    victim = Path(dist.locate_file("future_fstrings.py"))
+    assert victim.exists()
+    victim.unlink()
+
+    # A regular sync does not notice that a recorded file is missing.
+    result = pdm(["sync", "--no-self"], obj=project, strict=True, cleanup=False)
+    assert "All packages are synced to date" in result.stdout
+    assert not victim.exists()
+
+    # The repair is reported during a dry run but not applied.
+    result = pdm(["sync", "--no-self", "--repair", "--dry-run"], obj=project, strict=True, cleanup=False)
+    assert "Packages to update" in result.stdout
+    assert "future-fstrings 1.2.0 -> 1.2.0" in result.stdout
+    assert not victim.exists()
+
+    # --repair reinstalls only the corrupted distribution.
+    result = pdm(["sync", "--no-self", "--repair"], obj=project, strict=True, cleanup=False)
+    assert "1 to update" in result.stdout
+    assert victim.exists()
+
+    # Once repaired, another repair sync has nothing to do.
+    result = pdm(["sync", "--no-self", "--repair"], obj=project, strict=True, cleanup=False)
+    assert "All packages are synced to date" in result.stdout
+
+
+def test_sync_repair_can_be_enabled_in_config_and_detects_modification(project, index, pdm):
+    _use_future_fstrings_index(project, index)
+    pdm(["lock"], obj=project, strict=True, cleanup=False)
+    pdm(["sync", "--no-self"], obj=project, strict=True, cleanup=False)
+
+    dist = project.environment.get_working_set()["future-fstrings"]
+    victim = Path(dist.locate_file("future_fstrings.py"))
+    victim.write_bytes(victim.read_bytes() + b"# tampered\n")
+
+    project.project_config["install.repair"] = True
+    result = pdm(["sync", "--no-self"], obj=project, strict=True, cleanup=False)
+    assert "1 to update" in result.stdout
+
+    dist = project.environment.get_working_set()["future-fstrings"]
+    repaired = Path(dist.locate_file("future_fstrings.py"))
+    assert b"tampered" not in repaired.read_bytes()

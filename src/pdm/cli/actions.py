@@ -289,6 +289,7 @@ def do_sync(
     reinstall: bool = False,
     only_keep: bool = False,
     fail_fast: bool = False,
+    repair: bool = False,
     hooks: HookManager | None = None,
 ) -> None:
     """Synchronize project"""
@@ -311,6 +312,7 @@ def do_sync(
         reinstall=reinstall,
         only_keep=only_keep,
         fail_fast=fail_fast,
+        repair=True if repair else None,
         packages=packages,
     )
     with project.core.ui.logging("install"):

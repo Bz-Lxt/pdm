@@ -199,6 +199,13 @@ class Config(MutableMapping[str, str]):
             "Specify how to create links to the caches(`symlink/hardlink`)",
             "symlink",
         ),
+        "install.repair": ConfigItem(
+            "Check the installed packages against their installation records and "
+            "repair the corrupted ones when syncing",
+            False,
+            env_var="PDM_INSTALL_REPAIR",
+            coerce=ensure_boolean,
+        ),
         "python.providers": ConfigItem(
             "List of python provider names for findpython", default=[], coerce=split_by_comma
         ),

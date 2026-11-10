@@ -42,6 +42,12 @@ class Command(BaseCommand):
             action="store_true",
             help="Force reinstall existing dependencies",
         )
+        parser.add_argument(
+            "--repair",
+            action="store_true",
+            help="Verify installed packages against their installation records and "
+            "reinstall only the corrupted ones. [env var: PDM_INSTALL_REPAIR]",
+        )
 
     def handle(self, project: Project, options: argparse.Namespace) -> None:
         from pdm.cli import actions
@@ -58,5 +64,6 @@ class Command(BaseCommand):
             no_self=options.no_self or "default" not in selection,
             reinstall=options.reinstall,
             only_keep=options.only_keep,
+            repair=options.repair,
             hooks=HookManager(project, options.skip),
         )

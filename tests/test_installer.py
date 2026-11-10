@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
+import shutil
 import venv
 from collections.abc import Callable
 from pathlib import Path
@@ -15,6 +16,7 @@ from pdm.environments.base import BaseEnvironment
 from pdm.environments.local import PythonLocalEnvironment
 from pdm.environments.python import PythonEnvironment
 from pdm.installers import InstallManager
+from pdm.installers.base import is_distribution_damaged
 from pdm.models.cached_package import CachedPackage
 from pdm.models.candidates import Candidate
 from pdm.models.requirements import parse_requirement
@@ -317,3 +319,119 @@ def test_compress_file_list_for_rename():
     }
     abs_paths = {os.path.join(project_root, path) for path in paths}
     assert sorted(compress_for_rename(abs_paths)) == [os.path.join(project_root, "test-removal" + os.sep)]
+
+
+def _install_wheel(project, name: str, wheel: str, *, use_install_cache: bool = False):
+    candidate = Candidate(
+        parse_requirement(name),
+        link=Link(f"http://fixtures.test/artifacts/{wheel}"),
+    )
+    installer = InstallManager(project.environment, use_install_cache=use_install_cache)
+    installer.install(candidate)
+    return project.environment.get_working_set()[name]
+
+
+def test_intact_distribution_passes_record_check(project):
+    dist = _install_wheel(project, "demo", "demo-0.0.1-py2.py3-none-any.whl")
+    assert not is_distribution_damaged(dist)
+    # Files absent from RECORD are user-owned changes and must not be reported.
+    purelib = Path(project.environment.get_paths()["purelib"])
+    (purelib / "unrelated.txt").write_text("noise")
+    pycache = purelib / "__pycache__"
+    pycache.mkdir(exist_ok=True)
+    (pycache / "demo.cpython-311.pyc").write_bytes(b"\0")
+    assert not is_distribution_damaged(dist)
+
+
+def test_missing_or_modified_recorded_files_are_detected(project):
+    dist = _install_wheel(project, "demo", "demo-0.0.1-py2.py3-none-any.whl")
+    demo_py = Path(dist.locate_file("demo.py"))
+
+    demo_py.unlink()
+    assert is_distribution_damaged(dist)
+
+    dist = _install_wheel(project, "demo", "demo-0.0.1-py2.py3-none-any.whl")
+    demo_py = Path(dist.locate_file("demo.py"))
+    demo_py.write_bytes(demo_py.read_bytes() + b"# changed\n")
+    assert is_distribution_damaged(dist)
+
+    dist = _install_wheel(project, "demo", "demo-0.0.1-py2.py3-none-any.whl")
+    assert not is_distribution_damaged(dist)
+
+
+def test_missing_distribution_metadata_is_detected(project):
+    dist = _install_wheel(project, "demo", "demo-0.0.1-py2.py3-none-any.whl")
+    metadata = Path(dist.locate_file("demo-0.0.1.dist-info/METADATA"))
+    metadata.unlink()
+    assert is_distribution_damaged(dist)
+
+
+@pytest.mark.parametrize("preferred", ["symlink", "hardlink", None])
+def test_reinstall_over_cached_install(project, supports_link):
+    # Reinstalling must succeed even when links into the package store exist.
+    for _ in range(2):
+        _install_wheel(
+            project,
+            "future-fstrings",
+            "future_fstrings-1.2.0-py2.py3-none-any.whl",
+            use_install_cache=True,
+        )
+    dist = project.environment.get_working_set()["future-fstrings"]
+    assert not is_distribution_damaged(dist)
+
+
+@pytest.mark.parametrize("preferred", ["symlink", "hardlink", None])
+def test_cached_install_damage_detection(project, supports_link):
+    dist = _install_wheel(
+        project,
+        "future-fstrings",
+        "future_fstrings-1.2.0-py2.py3-none-any.whl",
+        use_install_cache=True,
+    )
+    assert not is_distribution_damaged(dist)
+
+    lib_path = Path(project.environment.get_paths()["purelib"])
+    (lib_path / "future_fstrings.py").unlink()
+    assert is_distribution_damaged(dist)
+
+    # A repair reinstall restores a healthy state.
+    dist = _install_wheel(
+        project,
+        "future-fstrings",
+        "future_fstrings-1.2.0-py2.py3-none-any.whl",
+        use_install_cache=True,
+    )
+    assert not is_distribution_damaged(dist)
+
+    # Removing the centralized cache entry breaks every link pointing to it.
+    refer_to = dist.read_text("REFER_TO")
+    if refer_to:
+        shutil.rmtree(refer_to)
+        assert is_distribution_damaged(dist)
+
+
+def test_editable_source_changes_are_not_reported_damaged(project, tmp_path_factory):
+    editable_path: Path = tmp_path_factory.mktemp("editable-project")
+    (editable_path / "setup.py").write_text(
+        """
+from setuptools import setup
+
+setup(name='editable-project',
+      version='0.1.0',
+      description='',
+      py_modules=['module'],
+)
+"""
+    )
+    module = editable_path / "module.py"
+    module.write_text("VALUE = 1\n")
+
+    req = parse_requirement(f"{editable_path.as_uri()}#egg=editable-project", True)
+    installer = InstallManager(project.environment)
+    installer.install(Candidate(req))
+    dist = project.environment.get_working_set()["editable-project"]
+
+    assert not is_distribution_damaged(dist)
+    # Editing the source tree is the point of editable installs.
+    module.write_text("VALUE = 2\n")
+    assert not is_distribution_damaged(dist)

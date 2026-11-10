@@ -32,6 +32,11 @@ class UvSynchronizer(BaseSynchronizer):
                 "uv doesn't support PEP 582 local packages, this error occurs because you set use_uv = true."
             )
 
+        if self.repair:
+            self.environment.project.core.ui.echo(
+                "[warning]The repair check is not supported with the uv installer, uv manages the environment itself."
+            )
+
         if self.dry_run:
             self.environment.project.core.ui.echo("[warning]uv doesn't support dry run mode, skipping installation")
             return

@@ -261,6 +261,31 @@ You can switch between them by running `pdm config [--local] install.cache_metho
 !!! note
     Only packages installed from one of the package sources can be cached.
 
+## Repair corrupted installations
+
+By default, `pdm sync` only compares the versions in the lockfile with the working set, so packages whose files have been deleted or modified after installation are left untouched. You can ask PDM to verify each installed distribution against its `RECORD` installation record and reinstall only the corrupted ones:
+
+```bash
+pdm sync --repair
+```
+
+The same check can be enabled permanently with the `install.repair` config or the `PDM_INSTALL_REPAIR` environment variable:
+
+```bash
+pdm config install.repair on
+```
+
+When the repair check is enabled, every distribution whose version already matches the lockfile is inspected:
+
+- A missing or altered recorded file, an unreadable `RECORD`, or a dangling symlink schedules that single distribution for reinstallation; healthy packages are not touched.
+- Editable installations and legacy distributions without a `RECORD` (egg-info) are skipped, because their files are user-owned and expected to change.
+- Centralized cache installations are handled correctly: the symlinks must still point into the cached package referenced by `REFER_TO`, and a removed cache entry is reported as damage and repaired.
+
+The check is opt-in and defaults to off, so a regular `pdm sync` behaves exactly as before.
+
+!!! note
+    The repair check is not supported when [`use_uv`](uv.md) is enabled, since `uv` manages the target environment itself. A warning is printed and the sync falls back to the normal `uv sync` behavior.
+
 ## Configure the repositories for upload
 
 When using the [`pdm publish`](../reference/cli.md#publish) command, it reads the repository secrets from the **global** config file(`<CONFIG_ROOT>/config.toml`). The content of the config is as follows:

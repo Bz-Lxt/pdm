@@ -108,6 +108,20 @@ class InstallDestination(SchemeDictionaryDestination):
             return
         super()._compile_bytecode(scheme, record)
 
+    def _path_with_destdir(self, scheme: Scheme, path: str) -> Path:
+        target_dir = Path(self.scheme_dict[scheme]).resolve()
+        path_obj = Path(path)
+        # Resolve the parent only: the leaf may already be a symlink to the
+        # centralized package store, which resolves outside of target_dir and
+        # would make a reinstall fail the destination safety check.
+        file = (target_dir / path_obj.parent).resolve() / path_obj.name
+        if not file.is_relative_to(target_dir):
+            raise ValueError(f"Attempting to write {path} outside of the target directory")
+        if self.destdir is not None:
+            rel_path = file.relative_to(file.anchor)
+            return Path(self.destdir) / rel_path
+        return file
+
     def finalize_installation(
         self,
         scheme: Scheme,
