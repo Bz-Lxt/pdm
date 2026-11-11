@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import hashlib
+import json
 import os
 import re
 import shlex
@@ -20,7 +22,7 @@ from pdm.cli.commands.base import BaseCommand
 from pdm.cli.hooks import HookManager
 from pdm.cli.options import skip_option, venv_option
 from pdm.cli.utils import check_project_file
-from pdm.exceptions import PdmUsageError
+from pdm.exceptions import PdmException, PdmUsageError
 from pdm.signals import pdm_signals
 from pdm.utils import deprecation_warning, expand_env_vars, is_path_relative_to
 
@@ -29,7 +31,10 @@ if TYPE_CHECKING:
     from typing import Any, TypedDict
 
     from pdm.environments import BaseEnvironment
+    from pdm.models.repositories import Package
+    from pdm.models.requirements import Requirement
     from pdm.project import Project
+    from pdm.project.lockfile.base import Lockfile
 
     class EnvFileOptions(TypedDict, total=True):
         override: str
@@ -202,18 +207,152 @@ class TaskRunner:
         self.hooks = hooks
         self.run_options: TaskOptions = {}
 
-    def _get_script_env(self, script_file: str) -> BaseEnvironment:
-        import hashlib
+    @staticmethod
+    def _make_script_hash(metadata: dict[str, Any]) -> str:
+        """Compute a stable hash of the PEP 723 metadata block.
 
+        Any change to the declared dependencies, requires-python or the
+        ``tool`` settings invalidates the cached resolution.
+        """
+        payload = json.dumps(metadata, sort_keys=True, ensure_ascii=False, default=str)
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    def _bind_script_lockfile(self, script_project: Project, venv: Path, venv_name: str) -> Lockfile:
+        """Attach a per-script lockfile stored next to its venv.
+
+        The lockfile lives outside the venv on purpose, so recreating the
+        environment keeps the exact pinned versions. It always uses the PDM
+        lock format since it is an internal cache rather than a project file.
+        """
+        from pdm.project.lockfile import FLAG_INHERIT_METADATA, PDMLock
+
+        lock_path = venv.parent / f"{venv_name}.lock"
+        try:
+            lockfile = PDMLock(lock_path, ui=script_project.core.ui)
+        except ValueError:
+            # A corrupted cache file must not block the script; resolve again
+            # and overwrite it.
+            lock_path.unlink(missing_ok=True)
+            lockfile = PDMLock(lock_path, ui=script_project.core.ui)
+        if script_project.config.get("use_uv") or not script_project.config["strategy.inherit_metadata"]:
+            lockfile.default_strategies.discard(FLAG_INHERIT_METADATA)
+        script_project._lockfile = lockfile
+        return lockfile
+
+    def _is_script_lock_fresh(self, script_project: Project, env: BaseEnvironment, script_hash: str) -> bool:
+        """Check whether the cached lock matches the script metadata and interpreter."""
+        from pdm.models.markers import EnvSpec
+        from pdm.project.lockfile.base import Compatibility
+
+        lockfile = script_project.lockfile
+        if not lockfile.exists() or lockfile.compatibility() == Compatibility.NONE:
+            return False
+        try:
+            data = lockfile.open_for_read()
+            metadata = data.get("metadata", {})
+            if metadata.get("script_hash") != script_hash:
+                return False
+            targets = [EnvSpec.from_spec(**target) for target in metadata.get("targets", [])]
+            if env.spec not in targets:
+                return False
+            locked_repo = script_project.get_locked_repository(env.spec)
+        except (PdmException, KeyError, TypeError, ValueError):
+            return False
+        return bool(locked_repo.packages)
+
+    def _resolve_script_requirements(
+        self, script_project: Project, env: BaseEnvironment, reqs: list[Requirement]
+    ) -> list[Package]:
+        """Resolve the script requirements with the configured (native or uv) backend."""
+        from pdm.resolver.reporters import LockReporter
+
+        reporter = LockReporter()
+        resolver = script_project.get_resolver(allow_uv=True)(
+            environment=env,
+            requirements=reqs,
+            update_strategy="all",
+            strategies=script_project.lockfile.default_strategies,
+            target=env.spec,
+            tracked_names=(),
+            keep_self=True,
+            reporter=reporter,
+        )
+        return list(resolver.resolve().packages)
+
+    def _write_script_lockfile(
+        self,
+        script_project: Project,
+        env: BaseEnvironment,
+        packages: list[Package],
+        script_hash: str,
+    ) -> None:
+        """Persist the resolved packages together with the script fingerprint."""
+        from pdm.models.repositories import LockedRepository
+
+        if not script_project.enable_write_lockfile:
+            return
+        lockfile = script_project.lockfile
+        strategy = lockfile.apply_strategy_change([])
+        locked_repo = LockedRepository({}, sources=script_project.sources, environment=env)
+        locked_repo.merge_result(env.spec, packages)
+        lockfile.format_lockfile(locked_repo, groups=["default"], strategy=strategy)
+        lockfile.open_for_write()["metadata"]["script_hash"] = script_hash
+        try:
+            lockfile.write(show_message=False)
+        except OSError:
+            # The cache location may be read-only; the script still runs with
+            # the resolution above, it just won't be reused next time.
+            self.project.core.ui.warn(
+                f"Failed to write the script lockfile [success]{lockfile._path}[/], "
+                "the resolved dependencies won't be cached."
+            )
+
+    def _sync_script_requirements(
+        self,
+        script_project: Project,
+        env: BaseEnvironment,
+        requirements: list[Requirement],
+        script_hash: str,
+    ) -> None:
+        """Install the script dependencies, reusing the cached lock when it is fresh."""
+        reqs = [req for req in requirements if not req.marker or req.marker.matches(env.spec)]
+        for req in reqs:
+            if req.is_file_or_url:
+                req.relocate(script_project.backend)  # type: ignore[attr-defined]
+        if self._is_script_lock_fresh(script_project, env, script_hash):
+            self.project.core.ui.info(
+                f"Reusing locked dependencies from [success]{script_project.lockfile._path}[/]",
+                verbosity=termui.Verbosity.DETAIL,
+            )
+            locked_repo = script_project.get_locked_repository(env.spec)
+            packages = list(locked_repo.evaluate_candidates(["default"]))
+            if not packages and reqs:
+                # The cached lock cannot satisfy this environment, resolve again.
+                packages = self._resolve_script_requirements(script_project, env, reqs)
+                self._write_script_lockfile(script_project, env, packages, script_hash)
+        else:
+            packages = self._resolve_script_requirements(script_project, env, reqs)
+            self._write_script_lockfile(script_project, env, packages, script_hash)
+        syncer = script_project.get_synchronizer(quiet=True, allow_uv=True)(
+            env,
+            clean=True,
+            retry_times=0,
+            install_self=False,
+            packages=packages,
+            requirements=reqs,
+        )
+        syncer.synchronize()
+
+    def _get_script_env(self, script_file: str) -> BaseEnvironment:
         from pdm.cli.commands.venv.backends import BACKENDS
         from pdm.environments import PythonEnvironment
-        from pdm.installers.core import install_requirements
         from pdm.models.venv import get_venv_python
 
         with open(script_file, encoding="utf8") as f:
             metadata = read_script_metadata(f.read(), "script")
         if not metadata:
             return self.project.environment
+        script_hash = self._make_script_hash(metadata)
         tool_config = metadata.pop("tool", {})
         script_project = self.project.core.create_project()
         script_project.pyproject.set_data(
@@ -222,18 +361,26 @@ class TaskRunner:
         venv_name = hashlib.md5(os.path.realpath(script_file).encode("utf-8"), usedforsecurity=False).hexdigest()
         venv_backend = BACKENDS[script_project.config["venv.backend"]](script_project, None)
         venv = venv_backend.get_location(None, venv_name)
+        self._bind_script_lockfile(script_project, venv, venv_name)
+        recreate = self.recreate_env or not venv.exists()
+        if not recreate:
+            # The interpreter is pinned by the venv. When it no longer satisfies
+            # the script's requires-python, recreate the venv so the backend can
+            # pick a compatible interpreter again.
+            probe = PythonEnvironment(script_project, python=get_venv_python(venv).as_posix())
+            recreate = not script_project.python_requires.contains(probe.interpreter.version, True)
         with contextlib.ExitStack() as stack:
-            if venv.exists() and not self.recreate_env:
-                stack.enter_context(self.project.core.ui.open_spinner("[info]Reusing existing script environment"))
-            else:
+            if recreate:
                 stack.enter_context(self.project.core.ui.open_spinner("[info]Creating environment for script"))
                 venv = venv_backend.create(venv_name=venv_name, force=True)
+            else:
+                stack.enter_context(self.project.core.ui.open_spinner("[info]Reusing existing script environment"))
             self.project.core.ui.info(f"Script environment location: {venv}", verbosity=termui.Verbosity.DETAIL)
             env = PythonEnvironment(script_project, python=get_venv_python(venv).as_posix())
             script_project._python = env.interpreter
             env.project = script_project  # keep a strong reference to the project
             if reqs := script_project.get_dependencies():
-                install_requirements(reqs, env, clean=True)
+                self._sync_script_requirements(script_project, env, list(reqs), script_hash)
         return env
 
     def get_task(self, script_name: str) -> Task | None:

@@ -1,0 +1,1 @@
+Cache the exact resolved dependencies of a PEP 723 inline script in a lockfile stored next to its virtual environment. Both the native and uv backends now reuse the pinned versions without re-resolving, and only refresh when the script metadata or the interpreter conditions change; recreating the environment installs the same versions.

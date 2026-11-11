@@ -1,5 +1,7 @@
+import hashlib
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -1269,6 +1271,187 @@ def test_run_script_with_inline_metadata_after_bom(project, pdm, local_finder_ar
     with cd(project.root):
         result = pdm(["run", "test_script.py"], obj=project)
         assert result.exit_code == 0
+
+
+def _script_env_paths(project, script_name="test_script.py"):
+    """Return the (venv, lockfile) paths used for the given inline script.
+
+    The inline-script project is created through ``core.create_project()`` and
+    therefore uses the default global config, including ``venv.location``.
+    """
+    script_project = project.core.create_project()
+    venv_parent = Path(script_project.config["venv.location"]).expanduser()
+    venv_name = hashlib.md5(
+        os.path.realpath(project.root / script_name).encode("utf-8"), usedforsecurity=False
+    ).hexdigest()
+    return venv_parent / venv_name, venv_parent / f"{venv_name}.lock"
+
+
+def _write_inline_script(project, dependencies, local_artifacts_url):
+    dep_lines = "\n".join(f'#   "{dep}",' for dep in dependencies)
+    project.root.joinpath("test_script.py").write_text(
+        "# /// script\n"
+        "# dependencies = [\n"
+        f"{dep_lines}\n"
+        "# ]\n"
+        "#\n"
+        "# [[tool.pdm.source]]\n"
+        '# name = "pypi"\n'
+        f'# url = "{local_artifacts_url}"\n'
+        '# type = "find_links"\n'
+        "# ///\n"
+        "from first import first\n"
+        "\n"
+        "assert first([0, False, 1, 2]) == 1\n"
+        'print("script ran OK")\n'
+    )
+
+
+def test_run_script_creates_and_reuses_lockfile(project, pdm, local_finder_artifacts, mocker):
+    from pdm.compat import tomllib
+    from pdm.resolver.resolvelib import RLResolver
+
+    _write_inline_script(project, ["first"], local_finder_artifacts.as_uri())
+    venv, lockfile = _script_env_paths(project)
+    resolve_spy = mocker.spy(RLResolver, "resolve")
+
+    with cd(project.root):
+        result = pdm(["run", "test_script.py"], obj=project)
+        assert result.exit_code == 0, result.stderr
+
+    assert venv.is_dir()
+    assert lockfile.is_file()
+    first_lock = lockfile.read_bytes()
+    lock_data = tomllib.loads(first_lock.decode())
+    assert lock_data["metadata"]["script_hash"]
+    assert lock_data["metadata"]["targets"]
+    assert {package["name"] for package in lock_data["package"]} == {"first"}
+    assert resolve_spy.call_count == 1
+
+    # The second run must reuse the cached resolution without re-resolving.
+    with cd(project.root):
+        result = pdm(["run", "-v", "test_script.py"], obj=project)
+        assert result.exit_code == 0, result.stderr
+    assert "Reusing locked dependencies" in result.stderr
+    assert lockfile.read_bytes() == first_lock
+    assert resolve_spy.call_count == 1
+
+
+def test_run_script_lockfile_refreshes_on_metadata_change(project, pdm, local_finder_artifacts):
+    from pdm.compat import tomllib
+
+    _write_inline_script(project, ["first"], local_finder_artifacts.as_uri())
+    _, lockfile = _script_env_paths(project)
+
+    with cd(project.root):
+        result = pdm(["run", "test_script.py"], obj=project)
+        assert result.exit_code == 0, result.stderr
+    old_hash = tomllib.loads(lockfile.read_text())["metadata"]["script_hash"]
+
+    _write_inline_script(project, ["first", "editables"], local_finder_artifacts.as_uri())
+    with cd(project.root):
+        result = pdm(["run", "test_script.py"], obj=project)
+        assert result.exit_code == 0, result.stderr
+
+    new_data = tomllib.loads(lockfile.read_text())
+    assert new_data["metadata"]["script_hash"] != old_hash
+    assert {package["name"] for package in new_data["package"]} == {"first", "editables"}
+
+
+def test_run_script_lockfile_survives_env_recreation(project, pdm, local_finder_artifacts):
+    _write_inline_script(project, ["first"], local_finder_artifacts.as_uri())
+    venv, lockfile = _script_env_paths(project)
+
+    with cd(project.root):
+        result = pdm(["run", "test_script.py"], obj=project)
+        assert result.exit_code == 0, result.stderr
+    assert lockfile.is_file()
+    cached_lock = lockfile.read_bytes()
+
+    # Simulate a destroyed environment: the lockfile must allow an exact rebuild.
+    shutil.rmtree(venv)
+    assert not venv.exists()
+    with cd(project.root):
+        result = pdm(["run", "-v", "test_script.py"], obj=project)
+        assert result.exit_code == 0, result.stderr
+    assert "Reusing locked dependencies" in result.stderr
+    assert lockfile.read_bytes() == cached_lock
+    assert venv.is_dir()
+    assert list(venv.glob("lib/python*/site-packages/first.py"))
+
+    # Explicit --recreate keeps the same pinned versions.
+    with cd(project.root):
+        result = pdm(["run", "--recreate", "test_script.py"], obj=project)
+        assert result.exit_code == 0, result.stderr
+    assert lockfile.read_bytes() == cached_lock
+
+
+def test_run_script_lockfile_refreshes_on_interpreter_change(project, pdm, local_finder_artifacts):
+    from pdm.compat import tomllib
+
+    _write_inline_script(project, ["first"], local_finder_artifacts.as_uri())
+    _, lockfile = _script_env_paths(project)
+
+    with cd(project.root):
+        result = pdm(["run", "test_script.py"], obj=project)
+        assert result.exit_code == 0, result.stderr
+    original_targets = tomllib.loads(lockfile.read_text())["metadata"]["targets"]
+    expected_python = original_targets[0]["requires_python"]
+
+    # Pretend the lock was resolved for a different interpreter.
+    content = lockfile.read_text()
+    lockfile.write_text(content.replace(f'requires_python = "{expected_python}"', 'requires_python = "==1.0.0"'))
+
+    with cd(project.root):
+        result = pdm(["run", "test_script.py"], obj=project)
+        assert result.exit_code == 0, result.stderr
+
+    targets = tomllib.loads(lockfile.read_text())["metadata"]["targets"]
+    assert expected_python in {target["requires_python"] for target in targets}
+    assert 'requires_python = "==1.0.0"' not in lockfile.read_text()
+
+
+def test_run_script_recreate_venv_when_requires_python_unsatisfied(project, pdm, local_finder_artifacts):
+    local_artifacts_url = local_finder_artifacts.as_uri()
+    project.root.joinpath("test_script.py").write_text(
+        textwrap.dedent(f"""\
+        # /// script
+        # requires-python = ">=3.9"
+        # dependencies = ["first"]
+        #
+        # [[tool.pdm.source]]
+        # name = "pypi"
+        # url = "{local_artifacts_url}"
+        # type = "find_links"
+        # ///
+        from first import first
+
+        assert first([0, False, 1, 2]) == 1
+        """)
+    )
+    with cd(project.root):
+        result = pdm(["run", "test_script.py"], obj=project)
+        assert result.exit_code == 0, result.stderr
+
+    # Tighten requires-python beyond any available interpreter: the cached venv
+    # must not be silently reused, the backend is asked to pick a compatible one.
+    project.root.joinpath("test_script.py").write_text(
+        textwrap.dedent(f"""\
+        # /// script
+        # requires-python = ">=999.0"
+        # dependencies = ["first"]
+        #
+        # [[tool.pdm.source]]
+        # name = "pypi"
+        # url = "{local_artifacts_url}"
+        # type = "find_links"
+        # ///
+        """)
+    )
+    with cd(project.root):
+        result = pdm(["run", "test_script.py"], obj=project)
+    assert result.exit_code != 0
+    assert "Can't resolve python interpreter" in result.stderr
 
 
 def test_read_script_metadata_ignores_leading_bom():

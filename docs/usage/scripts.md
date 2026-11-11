@@ -53,7 +53,12 @@ When you run it with `pdm run test_script.py`, PDM will create a temporary envir
 │   ('10', 'Voting Guidelines')
 ]
 ```
-Add `--reuse-env` option if you want to reuse the environment created last time.
+PDM creates a dedicated virtual environment for each script and reuses it on subsequent runs.
+The exact resolved dependencies are cached in a lockfile stored next to that environment, so they
+are installed again without re-resolution. The cache is refreshed only when the script metadata
+(for example the dependencies or `requires-python`) changes, or when the interpreter conditions
+no longer match; recreating the environment with `pdm run --recreate` still installs the same
+pinned versions from the cached lockfile.
 You can also add `[tool.pdm]` section to the script metadata to configure PDM. For example:
 
 ```python
