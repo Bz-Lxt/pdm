@@ -9,7 +9,7 @@ import os
 import sys
 import textwrap
 from collections.abc import Collection, Iterable
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, cast
 
 from resolvelib.resolvers import ResolutionImpossible, ResolutionTooDeep
 
@@ -30,6 +30,7 @@ from pdm.models.markers import EnvSpec
 from pdm.models.repositories import LockedRepository, Package
 from pdm.project import Project
 from pdm.project.lockfile import FLAG_CROSS_PLATFORM, FLAG_INHERIT_METADATA, FLAG_STATIC_URLS
+from pdm.project.lockfile.base import LockInputsState
 from pdm.resolver.reporters import RichLockReporter
 from pdm.termui import logger
 from pdm.utils import deprecation_warning
@@ -81,6 +82,7 @@ def do_lock(
 
     if groups is None:
         groups = list(project.iter_groups())
+    provided_requirements = requirements
     if not requirements:
         all_deps = project._resolve_dependencies(groups)
         requirements = [r for group in groups for r in project.get_dependencies(group, all_deps)]
@@ -88,12 +90,6 @@ def do_lock(
         requirements = project.with_workspace_dependencies(requirements)
     ui = project.core.ui
     supports_env_spec = "env_spec" in inspect.signature(project.get_provider).parameters
-    # The repository to store the lock result
-    if locked_repo.packages:
-        result_repo = LockedRepository({}, sources=project.sources, environment=project.environment)
-    else:
-        # Use the same repository if the lock is empty.
-        result_repo = locked_repo
     if not supports_env_spec:  # pragma: no cover
         ui.warn("Lock targets are not supported by the current provider")
 
@@ -116,6 +112,44 @@ def do_lock(
                 f"the project's requires-python {global_requires_python}"
             )
         targets[i] = target.replace(requires_python=merged)
+
+    # Incremental locking: re-resolve only the dependency closure touched by the
+    # changed inputs and keep every unrelated target, version, marker and artifact
+    # record untouched. Anything outside the safe conditions falls back to a full
+    # re-resolution with the requested update strategy.
+    incremental_plan: dict[str, Any] | None = None
+    if (
+        strategy == "all"
+        and not refresh
+        and not append
+        and env_spec is None
+        and not strategy_change
+        and tracked_names is None
+        and provided_requirements is None
+        and not project.core.state.exclude_newer
+        and not project.core.state.exclude_newer_overrides
+        and not project.config.get("use_uv")
+        and bool(locked_repo.packages)
+        and project.lock_inputs_enabled()
+        and project.lockfile.lock_inputs_state is LockInputsState.SUPPORTED
+    ):
+        from pdm.project.lockfile.freshness import build_incremental_lock_plan
+
+        try:
+            incremental_plan = build_incremental_lock_plan(project, locked_repo, targets=targets)
+        except (PdmException, TypeError, ValueError):
+            logger.warning("Failed to build an incremental lock plan, falling back to a full lock")
+            incremental_plan = None
+
+    # The repository to store the lock result
+    if incremental_plan is not None or append:
+        # Update the locked repository in place so untouched packages stay stable.
+        result_repo = locked_repo
+    elif locked_repo.packages:
+        result_repo = LockedRepository({}, sources=project.sources, environment=project.environment)
+    else:
+        # Use the same repository if the lock is empty.
+        result_repo = locked_repo
     resolve_max_rounds = int(project.config["strategy.resolve_max_rounds"])
     hooks.try_emit("pre_lock", requirements=requirements, dry_run=dry_run)
     with ui.logging("lock"):
@@ -129,23 +163,46 @@ def do_lock(
         with RichLockReporter(requirements, ui) as reporter:
             collected_groups: set[str] = set()
             try:
-                for target in targets:
-                    resolver = resolver_class(
-                        environment=project.environment,
-                        requirements=[r for r in requirements if not r.marker or r.marker.matches(target)],
-                        update_strategy=strategy,
-                        strategies=lock_strategy,
-                        target=target,
-                        tracked_names=list(tracked_names or ()),
-                        locked_repository=locked_repo,
-                        reporter=reporter,
-                    )
-                    reporter.update(f"Resolve for environment {target}")
-                    resolved, new_groups = resolver.resolve()
-                    collected_groups.update(new_groups)
-                    locked_repo.merge_result(target, resolved)
-                    if result_repo is not locked_repo:
-                        result_repo.merge_result(target, resolved)
+                if incremental_plan is not None:
+                    plan_targets = set(incremental_plan["affected_targets"])
+                    resolve_targets = [target for target in targets if target in plan_targets]
+                    closure_names = incremental_plan["tracked_names"]
+                    target_results: dict[EnvSpec, Iterable[Package]] = {}
+                    for target in resolve_targets:
+                        resolver = resolver_class(
+                            environment=project.environment,
+                            requirements=[r for r in requirements if not r.marker or r.marker.matches(target)],
+                            update_strategy="reuse",
+                            strategies=lock_strategy,
+                            target=target,
+                            tracked_names=sorted(closure_names),
+                            locked_repository=locked_repo,
+                            reporter=reporter,
+                        )
+                        reporter.update(f"Resolve for environment {target}")
+                        resolved, new_groups = resolver.resolve()
+                        collected_groups.update(new_groups)
+                        target_results[target] = resolved
+                    if resolve_targets:
+                        locked_repo.merge_incremental(resolve_targets, target_results, closure_names)
+                else:
+                    for target in targets:
+                        resolver = resolver_class(
+                            environment=project.environment,
+                            requirements=[r for r in requirements if not r.marker or r.marker.matches(target)],
+                            update_strategy=strategy,
+                            strategies=lock_strategy,
+                            target=target,
+                            tracked_names=list(tracked_names or ()),
+                            locked_repository=locked_repo,
+                            reporter=reporter,
+                        )
+                        reporter.update(f"Resolve for environment {target}")
+                        resolved, new_groups = resolver.resolve()
+                        collected_groups.update(new_groups)
+                        locked_repo.merge_result(target, resolved)
+                        if result_repo is not locked_repo:
+                            result_repo.merge_result(target, resolved)
             except ResolutionTooDeep:
                 reporter.update(f"{termui.Emoji.LOCK} Lock failed.", info="", completed=1)
                 ui.echo(

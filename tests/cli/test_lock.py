@@ -1292,3 +1292,258 @@ def test_lock_with_invalid_python_requirement(project, pdm):
     assert "requests" in project.get_locked_repository().candidates
     assert "python" not in project.get_locked_repository().candidates
     assert "The 'python' requirement is not necessary and will be ignored." in result.stderr
+
+
+def _lock_repo_snapshot(project):
+    project.lockfile.reload()
+    repo = project.get_locked_repository()
+    return {
+        key: (
+            entry.candidate.version,
+            None if entry.candidate.req.marker is None else str(entry.candidate.req.marker),
+            [dict(file_hash) for file_hash in entry.candidate.hashes],
+            list(entry.candidate.req.groups or ()),
+        )
+        for key, entry in repo.packages.items()
+    }
+
+
+def _reload_project(core, project):
+    return core.create_project(project.root, global_config=project.global_config.config_file.as_posix())
+
+
+def _write_member_pyproject(project, name, dependencies):
+    member_path = project.root / "packages" / name
+    member_path.mkdir(parents=True, exist_ok=True)
+    dependency_lines = ", ".join(f"'{dependency}'" for dependency in dependencies)
+    member_path.joinpath("pyproject.toml").write_text(
+        f'[project]\nname = "{name}"\nversion = "0.1.0"\ndependencies = [{dependency_lines}]\n',
+        encoding="utf-8",
+    )
+
+
+def _make_marked_workspace(project, core, members):
+    project.pyproject.settings["workspace"] = {"members": ["packages/*"]}
+    project.pyproject.write()
+    for name, dependencies in members.items():
+        _write_member_pyproject(project, name, dependencies)
+    return core.create_project(project.root, global_config=project.global_config.config_file.as_posix())
+
+
+@pytest.mark.usefixtures("repository")
+@pytest.mark.parametrize("lock_format", ["pdm", "pylock"])
+def test_incremental_lock_only_resolves_affected_target(project, core, pdm, lock_format, mocker):
+    from pdm.resolver.resolvelib import RLResolver
+
+    project.project_config["lock.format"] = lock_format
+    workspace_project = _make_marked_workspace(
+        project,
+        core,
+        {
+            "foo": ['requests; sys_platform == "win32"'],
+            "bar": ["django<2"],
+        },
+    )
+    enable_lock_inputs(workspace_project)
+    pdm(["lock", "--platform", "windows"], obj=workspace_project, strict=True)
+    pdm(["lock", "--platform", "linux", "--append"], obj=workspace_project, strict=True)
+    assert len(workspace_project.get_locked_repository().targets) == 2
+
+    before = _lock_repo_snapshot(workspace_project)
+    # Change only one member's default group; all its requirements stay windows-only.
+    _write_member_pyproject(
+        workspace_project,
+        "foo",
+        ['requests; sys_platform == "win32"', 'pysocks; sys_platform == "win32"'],
+    )
+    fresh_project = _reload_project(core, workspace_project)
+    resolve_spy = mocker.spy(RLResolver, "resolve")
+
+    pdm(["lock"], obj=fresh_project, strict=True)
+
+    # Only the windows target is affected, the linux target is not re-resolved.
+    assert resolve_spy.call_count == 1
+    after = _lock_repo_snapshot(workspace_project)
+    # The unrelated member keeps identical versions, markers, groups and artifacts.
+    untouched = {"bar", "django", "pytz", "sqlparse"}
+    for key, value in before.items():
+        if key[0] in untouched:
+            assert after[key] == value
+    # Both lock targets and the unrelated target's package records are preserved.
+    locked_repo = fresh_project.get_locked_repository()
+    assert len(locked_repo.targets) == 2
+    # The new dependency is locked for the windows target only.
+    pysocks = locked_repo.all_candidates["pysocks"]
+    assert len(pysocks) == 1
+    assert str(pysocks[0].req.marker) == 'sys_platform == "win32"'
+    assert fresh_project.is_lockfile_fresh()
+
+
+@pytest.mark.usefixtures("repository")
+@pytest.mark.parametrize("lock_format", ["pdm", "pylock"])
+def test_incremental_lock_without_changes_skips_resolution(project, core, pdm, lock_format, mocker):
+    from pdm.resolver.resolvelib import RLResolver
+
+    project.project_config["lock.format"] = lock_format
+    workspace_project = make_workspace_members(project, core, {"foo": ["requests"], "bar": ["django<2"]})
+    enable_lock_inputs(workspace_project)
+    pdm(["lock"], obj=workspace_project, strict=True)
+    before = _lock_repo_snapshot(workspace_project)
+
+    resolve_spy = mocker.spy(RLResolver, "resolve")
+    pdm(["lock"], obj=workspace_project, strict=True)
+
+    assert resolve_spy.call_count == 0
+    assert _lock_repo_snapshot(workspace_project) == before
+    assert workspace_project.is_lockfile_fresh()
+
+
+@pytest.mark.usefixtures("repository")
+@pytest.mark.parametrize("lock_format", ["pdm", "pylock"])
+def test_incremental_lock_falls_back_for_global_input_change(project, core, pdm, lock_format, mocker):
+    from pdm.resolver.resolvelib import RLResolver
+
+    project.project_config["lock.format"] = lock_format
+    workspace_project = make_workspace_members(project, core, {"foo": ["requests"], "bar": ["django<2"]})
+    enable_lock_inputs(workspace_project)
+    pdm(["lock", "--platform", "windows"], obj=workspace_project, strict=True)
+    pdm(["lock", "--platform", "linux", "--append"], obj=workspace_project, strict=True)
+
+    pyproject = workspace_project.root / "pyproject.toml"
+    pyproject.write_text(
+        pyproject.read_text(encoding="utf-8").replace('requires-python = ">=3.7"', 'requires-python = ">=3.8"', 1),
+        encoding="utf-8",
+    )
+    fresh_project = _reload_project(core, workspace_project)
+    resolve_spy = mocker.spy(RLResolver, "resolve")
+
+    pdm(["lock"], obj=fresh_project, strict=True)
+
+    # A global input change invalidates the incremental plan: every target is resolved.
+    assert resolve_spy.call_count == 2
+    assert len(fresh_project.get_locked_repository().targets) == 2
+    assert fresh_project.is_lockfile_fresh()
+
+
+@pytest.mark.usefixtures("repository")
+@pytest.mark.parametrize("lock_format", ["pdm", "pylock"])
+def test_incremental_lock_tracks_specifier_only_changes(project, core, pdm, lock_format, mocker):
+    from pdm.resolver.resolvelib import RLResolver
+
+    project.project_config["lock.format"] = lock_format
+    workspace_project = _make_marked_workspace(
+        project,
+        core,
+        {
+            "foo": ['django<2; sys_platform == "win32"'],
+            "bar": ["requests"],
+        },
+    )
+    enable_lock_inputs(workspace_project)
+    pdm(["lock", "--platform", "windows"], obj=workspace_project, strict=True)
+    pdm(["lock", "--platform", "linux", "--append"], obj=workspace_project, strict=True)
+    assert workspace_project.get_locked_repository().all_candidates["django"][0].version == "1.11.8"
+
+    # A specifier-only edit keeps the requirement fingerprint but invalidates the pin.
+    _write_member_pyproject(workspace_project, "foo", ['django>=2; sys_platform == "win32"'])
+    fresh_project = _reload_project(core, workspace_project)
+    resolve_spy = mocker.spy(RLResolver, "resolve")
+
+    pdm(["lock"], obj=fresh_project, strict=True)
+
+    assert resolve_spy.call_count == 1
+    locked_repo = fresh_project.get_locked_repository()
+    django_candidates = locked_repo.all_candidates["django"]
+    assert len(django_candidates) == 1
+    assert django_candidates[0].version == "2.2.9"
+    assert str(django_candidates[0].req.marker) == 'sys_platform == "win32"'
+    # The unrelated member's closure is still untouched.
+    assert locked_repo.all_candidates["requests"][0].version == "2.19.1"
+    assert len(locked_repo.targets) == 2
+    assert fresh_project.is_lockfile_fresh()
+
+
+@pytest.mark.usefixtures("repository")
+@pytest.mark.parametrize("lock_format", ["pdm", "pylock"])
+def test_incremental_lock_preserves_artifacts_of_unaffected_packages(project, core, pdm, lock_format, mocker):
+    from pdm.pytest import TestRepository
+
+    project.project_config["lock.format"] = lock_format
+    workspace_project = _make_marked_workspace(
+        project,
+        core,
+        {
+            "foo": ['requests; sys_platform == "win32"'],
+            "bar": ["django<2"],
+        },
+    )
+    enable_lock_inputs(workspace_project)
+    round_counter = {"n": 0}
+
+    def changing_get_hashes(self, candidate):
+        label = f"{candidate.identify()}-{candidate.version}-{round_counter['n']}"
+        return [
+            {
+                "url": f"https://example.test/{label}.whl",
+                "hash": f"sha256:{label}",
+                "file": f"{label}.whl",
+            }
+        ]
+
+    mocker.patch.object(TestRepository, "get_hashes", changing_get_hashes)
+    round_counter["n"] = 1
+    pdm(["lock", "--platform", "windows"], obj=workspace_project, strict=True)
+    pdm(["lock", "--platform", "linux", "--append"], obj=workspace_project, strict=True)
+    before = _lock_repo_snapshot(workspace_project)
+
+    # New resolutions would return different artifact records; untouched entries
+    # must keep the records written by the first lock.
+    round_counter["n"] = 2
+    _write_member_pyproject(
+        workspace_project,
+        "foo",
+        ['requests; sys_platform == "win32"', 'pysocks; sys_platform == "win32"'],
+    )
+    fresh_project = _reload_project(core, workspace_project)
+    pdm(["lock"], obj=fresh_project, strict=True)
+    after = _lock_repo_snapshot(workspace_project)
+
+    untouched = {"bar", "django", "pytz", "sqlparse"}
+    for key, value in before.items():
+        if key[0] in untouched:
+            assert after[key] == value
+    requests_entry = next(value for key, value in after.items() if key[0] == "requests")
+    assert any("-2.whl" in file_hash["file"] for file_hash in requests_entry[2])
+
+
+@pytest.mark.usefixtures("repository")
+@pytest.mark.parametrize("lock_format", ["pdm", "pylock"])
+def test_incremental_lock_prunes_dropped_closure_packages(project, core, pdm, lock_format):
+    project.project_config["lock.format"] = lock_format
+    workspace_project = _make_marked_workspace(
+        project,
+        core,
+        {
+            "foo": [
+                'requests; sys_platform == "win32"',
+                'pysocks; sys_platform == "win32"',
+            ],
+            "bar": ["django<2"],
+        },
+    )
+    enable_lock_inputs(workspace_project)
+    pdm(["lock", "--platform", "windows"], obj=workspace_project, strict=True)
+    pdm(["lock", "--platform", "linux", "--append"], obj=workspace_project, strict=True)
+    assert "pysocks" in workspace_project.get_locked_repository().all_candidates
+
+    # Drop the only requirement pulling pysocks; it must be pruned while the
+    # unrelated member's closure survives.
+    _write_member_pyproject(workspace_project, "foo", ['requests; sys_platform == "win32"'])
+    fresh_project = _reload_project(core, workspace_project)
+    pdm(["lock"], obj=fresh_project, strict=True)
+
+    locked_repo = fresh_project.get_locked_repository()
+    assert "pysocks" not in locked_repo.all_candidates
+    assert locked_repo.all_candidates["django"][0].version == "1.11.8"
+    assert len(locked_repo.targets) == 2
+    assert fresh_project.is_lockfile_fresh()

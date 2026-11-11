@@ -358,3 +358,86 @@ class LockedRepository(BaseRepository):
         # clear caches
         if "all_candidates" in self.__dict__:
             del self.__dict__["all_candidates"]
+
+    def merge_incremental(
+        self,
+        affected_targets: Collection[EnvSpec],
+        target_results: Mapping[EnvSpec, Iterable[Package]],
+        closure_names: Collection[str],
+    ) -> None:
+        """Merge re-resolved targets while preserving entries outside the closure.
+
+        Packages whose normalized name is in ``closure_names`` get the marker
+        contribution of ``affected_targets`` replaced (rather than unioned) by
+        the freshly resolved one, and entries that no longer apply to any target
+        are removed. Every other package keeps its existing version, marker,
+        groups and artifact hashes untouched.
+        """
+        if not affected_targets:
+            return
+        unaffected_targets = [target for target in self.targets if target not in set(affected_targets)]
+        closure = set(closure_names)
+        # Snapshot the markers the closure entries had before merging anything.
+        snapshot: dict[CandidateKey, BaseMarker | None] = {
+            key: (entry.candidate.req.marker.inner if entry.candidate.req.marker is not None else None)
+            for key, entry in self.packages.items()
+            if key[0] in closure
+        }
+        new_markers: dict[CandidateKey, list[BaseMarker]] = {}
+        new_entries: dict[CandidateKey, Package] = {}
+        resolved_keys: set[CandidateKey] = set()
+        for target, result in target_results.items():
+            result = list(result)
+            resolved_keys.update(self._identify_candidate(entry.candidate) for entry in result)
+            # Entries outside the closure can't change: their dependency subgraph
+            # is untouched, so skip them entirely to preserve their markers,
+            # groups and artifact hashes byte for byte.
+            closure_result = [entry for entry in result if entry.candidate.identify() in closure]
+            self.merge_result(target, closure_result)
+            for entry in closure_result:
+                key = self._identify_candidate(entry.candidate)
+                marker = entry.candidate.req.marker
+                new_markers.setdefault(key, []).append(marker.inner if marker is not None else AnyMarker())
+                new_entries[key] = entry
+        for key in [key for key in self.packages if key[0] in closure]:
+            parts: list[BaseMarker] = []
+            # Keep only the marker coverage that belongs to targets we didn't touch.
+            if key in snapshot:
+                snapshot_marker = snapshot[key]
+                old_marker: BaseMarker = AnyMarker() if snapshot_marker is None else snapshot_marker
+                for target in unaffected_targets:
+                    retained = old_marker & target.markers_with_python().inner
+                    if not retained.is_empty():
+                        parts.append(retained)
+            parts.extend(part for part in new_markers.get(key, ()) if not part.is_empty())
+            if not parts:
+                del self.packages[key]
+                continue
+            final_marker = parts[0]
+            for part in parts[1:]:
+                final_marker = final_marker | part
+            entry = self.packages[key]
+            entry.candidate.req = dataclasses.replace(
+                entry.candidate.req,
+                marker=None if final_marker.is_any() else Marker(final_marker),
+            )
+            fresh_entry = new_entries.get(key)
+            if fresh_entry is not None:
+                self.packages[key] = dataclasses.replace(
+                    entry,
+                    dependencies=fresh_entry.dependencies,
+                    summary=fresh_entry.summary or entry.summary,
+                )
+        # Generic pruning: drop entries that disappeared from every re-resolved
+        # target and no unaffected target still references. This also covers
+        # closures whose dependency edges aren't recorded in the lockfile (e.g.
+        # editable members in pylock format).
+        for key in [key for key in self.packages if key not in resolved_keys]:
+            entry = self.packages[key]
+            marker = entry.candidate.req.marker
+            old_marker = AnyMarker() if marker is None else marker.inner
+            if any(not (old_marker & target.markers_with_python().inner).is_empty() for target in unaffected_targets):
+                continue
+            del self.packages[key]
+        if "all_candidates" in self.__dict__:
+            del self.__dict__["all_candidates"]
